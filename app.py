@@ -182,6 +182,14 @@ User Question:
 
     answer = response.content
     st.session_state.last_context = context
+    
+    # OPTIMIZATION: Reset quiz when new answer is generated
+    # This prevents showing old quiz for new questions
+    st.session_state.quiz_data = None
+    st.session_state.quiz_answers = []
+    st.session_state.quiz_submitted = False
+    st.session_state.show_simplification = False
+    st.session_state.simplified_explanation = ""
 
     return answer
 
@@ -267,56 +275,320 @@ def render_export_button():
 
 
 # ============================================================================
-# QUIZ GENERATION
+# QUIZ GENERATION (5 Questions + Evaluation)
 # ============================================================================
 
-def generate_quiz(context):
-    """Generate a quiz question from the given context."""
-    quiz_prompt = f"""
-    Using ONLY the context below, generate exactly ONE multiple-choice question.
-
-    Context:
-    {context}
-
-    Return ONLY valid JSON.
-
-    Example:
-    {{
-        "question": "What is insertion sort?",
-        "options": [
-            "A sorting algorithm",
-            "A searching algorithm",
-            "A graph algorithm",
-            "A tree algorithm"
-        ],
-        "answer": "A sorting algorithm"
-    }}
+def generate_quiz_questions(context):
     """
+    Generate exactly 5 conceptual multiple-choice questions from the context.
+    OPTIMIZATION:
+    - Generated once per assistant response
+    - Stored in session state (not regenerated on reruns)
+    - Focuses on conceptual understanding, not memorization
+    """
+    quiz_prompt = f"""
+You are an educational expert. Generate exactly 5 multiple-choice questions to test conceptual understanding of the following content. Do NOT generate memorization questions.
+
+Content:
+{context}
+
+Requirements:
+- Each question should test deeper understanding, application, or critical thinking
+- Each question must have exactly 4 options
+- Exactly ONE option is correct
+- Options should be plausible but clearly distinguishable
+- Questions should cover different aspects of the content
+
+Return a JSON array (ONLY valid JSON, no other text). Example format:
+[
+  {{
+    "question": "Which of the following best explains why insertion sort is less efficient than merge sort for large datasets?",
+    "options": ["It has a higher space complexity", "It performs more comparisons in the average case", "It requires more iterations per element", "It cannot handle duplicate values"],
+    "correct_answer": "It performs more comparisons in the average case",
+    "explanation": "Insertion sort has O(n²) average time complexity due to the nested loop structure that compares elements sequentially."
+  }}
+]
+
+Generate 5 questions now:
+"""
 
     response = st.session_state.conversation["llm"].invoke(quiz_prompt)
+    
+    # Parse JSON response carefully
+    try:
+        # Extract JSON from response (may have extra text)
+        import re
+        json_match = re.search(r'\[.*\]', response.content, re.DOTALL)
+        if json_match:
+            questions = json.loads(json_match.group())
+            return questions
+        else:
+            # Fallback if JSON not found
+            questions = json.loads(response.content)
+            return questions
+    except json.JSONDecodeError:
+        st.error("Failed to parse quiz questions. Please try again.")
+        return None
+
+
+def identify_weak_topics(questions, answers):
+    """
+    Identify weak topics based on incorrect answers.
+    OPTIMIZATION:
+    - Analyzes patterns in wrong answers
+    - No additional LLM call (uses stored data)
+    """
+    weak_topics = []
+    
+    if not questions or not answers:
+        return weak_topics
+    
+    for idx, q in enumerate(questions):
+        if idx < len(answers) and answers[idx] != q.get("correct_answer"):
+            # Extract topic from question
+            topic = q.get("question", f"Question {idx+1}").split("?")[0][:50]
+            weak_topics.append({
+                "question_num": idx + 1,
+                "topic": topic,
+                "concept": q.get("explanation", "")[:100],
+                "user_answer": answers[idx],
+                "correct_answer": q.get("correct_answer"),
+                "explanation": q.get("explanation", "")
+            })
+    
+    return weak_topics
+
+
+def generate_simplified_explanation(context, weak_topics):
+    """
+    Generate a simpler explanation when user struggles with quiz.
+    OPTIMIZATION:
+    - Only called if user explicitly requests simpler explanation
+    - Uses existing context (no additional retrieval)
+    """
+    weak_concepts = "\n".join([t.get("concept", "") for t in weak_topics])
+    
+    simplification_prompt = f"""
+The user struggled with understanding these concepts from the material:
+{weak_concepts}
+
+Please provide a MUCH SIMPLER explanation using:
+- Simpler vocabulary
+- Real-world examples or analogies
+- Step-by-step breakdowns
+- Concrete examples from the context below
+
+Original Context:
+{context}
+
+Generate a clear, beginner-friendly explanation:
+"""
+
+    response = st.session_state.conversation["llm"].invoke(simplification_prompt)
     return response.content
 
 
-def render_quiz():
+# ============================================================================
+# QUIZ UI & RENDERING
+# ============================================================================
+
+def render_quiz_interface():
     """
-    Render the quiz button and display quiz if toggled.
+    Display the quiz interface with 5 questions and radio buttons.
     OPTIMIZATION:
-    - Quiz generation only happens when show_quiz is True
-    - Cached context prevents redundant retrieval
-    - Toggle state prevents repeated quiz generation on reruns
+    - Uses cached quiz_data from session state
+    - Does not regenerate quiz on reruns
+    """
+    if not st.session_state.quiz_data:
+        return
+    
+    st.divider()
+    st.subheader("📝 Test Your Understanding (5 Questions)")
+    st.markdown("Answer all questions below and click **Submit Quiz** to see your results.")
+    
+    # Initialize answers if not already in session
+    if "quiz_answers" not in st.session_state:
+        st.session_state.quiz_answers = [None] * len(st.session_state.quiz_data)
+    
+    # Render each question with radio buttons
+    for idx, question in enumerate(st.session_state.quiz_data):
+        st.markdown(f"**Question {idx + 1}:** {question.get('question', '')}")
+        
+        # Radio buttons for options
+        selected_option = st.radio(
+            label=f"question_{idx}",
+            options=question.get("options", []),
+            label_visibility="collapsed",
+            key=f"quiz_q{idx}"
+        )
+        
+        # Store answer in session state
+        if selected_option:
+            st.session_state.quiz_answers[idx] = selected_option
+        
+        st.markdown("---")
+    
+    # Submit button
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("✅ Submit Quiz", key="submit_quiz_btn", use_container_width=True):
+            # Check if all questions answered
+            if None in st.session_state.quiz_answers:
+                st.warning("⚠️ Please answer all questions before submitting.")
+            else:
+                st.session_state.quiz_submitted = True
+                st.rerun()
+
+
+def render_quiz_results():
+    """
+    Display quiz results, score, and weak topic analysis.
+    OPTIMIZATION:
+    - Only renders if quiz was submitted
+    - Displays results once per submission
+    """
+    if not st.session_state.quiz_submitted or not st.session_state.quiz_data:
+        return
+    
+    st.divider()
+    st.subheader("📊 Quiz Results")
+    
+    # Calculate score
+    score = 0
+    for idx, question in enumerate(st.session_state.quiz_data):
+        correct = question.get("correct_answer")
+        if idx < len(st.session_state.quiz_answers) and st.session_state.quiz_answers[idx] == correct:
+            score += 1
+    
+    total = len(st.session_state.quiz_data)
+    
+    # Display score with formatting
+    score_color = "green" if score >= 3 else "orange" if score >= 2 else "red"
+    st.markdown(f"### 🎯 Score: **{score}/{total}**")
+    
+    # Show incorrect answers
+    incorrect_count = 0
+    for idx, question in enumerate(st.session_state.quiz_data):
+        correct = question.get("correct_answer")
+        if idx < len(st.session_state.quiz_answers) and st.session_state.quiz_answers[idx] != correct:
+            incorrect_count += 1
+            st.markdown(f"**Question {idx + 1}:** ❌ Incorrect")
+            st.markdown(f"- Your answer: *{st.session_state.quiz_answers[idx]}*")
+            st.markdown(f"- Correct answer: *{correct}*")
+            st.markdown(f"- {question.get('explanation', '')}")
+            st.markdown("---")
+    
+    # Show weak topics if any
+    if incorrect_count > 0:
+        weak_topics = identify_weak_topics(st.session_state.quiz_data, st.session_state.quiz_answers)
+        
+        if weak_topics:
+            st.subheader("🎯 Areas to Improve")
+            for topic in weak_topics:
+                st.markdown(f"**{topic['concept']}**")
+                st.markdown(f"→ {topic['explanation']}")
+            
+            # Adaptive learning offer
+            if score < 3:
+                st.warning("💡 It looks like you're finding this topic challenging. Would you like a simpler explanation?")
+                col1, col2 = st.columns(2)
+                with col1:
+                    if st.button("Yes, explain more simply", key="simplify_yes"):
+                        st.session_state.show_simplification = True
+                        st.rerun()
+                with col2:
+                    if st.button("No, I'm ready to move on", key="simplify_no"):
+                        st.session_state.quiz_submitted = False
+                        st.session_state.quiz_data = None
+                        st.session_state.quiz_answers = []
+                        st.rerun()
+    
+    else:
+        st.success(f"🎉 Perfect! You scored {score}/{total}. Great understanding!")
+        if st.button("Clear quiz and continue", key="clear_quiz"):
+            st.session_state.quiz_submitted = False
+            st.session_state.quiz_data = None
+            st.session_state.quiz_answers = []
+            st.rerun()
+
+
+def render_simplified_explanation_section():
+    """
+    Display simplified explanation if user requested it.
+    OPTIMIZATION:
+    - Only renders if user clicked "Yes" for simpler explanation
+    - Generated once and cached in session state
+    """
+    if not st.session_state.show_simplification:
+        return
+    
+    if not st.session_state.conversation:
+        return
+    
+    st.divider()
+    st.subheader("📚 Simplified Explanation")
+    
+    # Generate simplified explanation if not already cached
+    if "simplified_explanation" not in st.session_state:
+        weak_topics = identify_weak_topics(st.session_state.quiz_data, st.session_state.quiz_answers)
+        with st.spinner("Generating simplified explanation..."):
+            simplified = generate_simplified_explanation(st.session_state.last_context, weak_topics)
+            st.session_state.simplified_explanation = simplified
+    
+    # Display explanation
+    st.markdown(st.session_state.simplified_explanation)
+    
+    # Option to continue
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Back to quiz results", key="back_to_results"):
+            st.session_state.show_simplification = False
+            st.rerun()
+    with col2:
+        if st.button("Return to chat", key="return_to_chat"):
+            st.session_state.quiz_submitted = False
+            st.session_state.quiz_data = None
+            st.session_state.quiz_answers = []
+            st.session_state.show_simplification = False
+            st.session_state.simplified_explanation = ""
+            st.rerun()
+
+
+def render_quiz_section():
+    """
+    Main orchestrator for the entire quiz feature.
+    OPTIMIZATION:
+    - Only renders if chat history exists
+    - Generates quiz only once per assistant response
+    - Handles all quiz states: generation, answering, evaluation, simplification
     """
     if not st.session_state.chat_history:
         return
-
-    if st.button("🧠 Test My Understanding", key="latest_quiz"):
-        st.session_state.show_quiz = not st.session_state.show_quiz
-
-    # OPTIMIZATION: Only generate quiz if explicitly toggled on
-    if st.session_state.show_quiz and st.session_state.last_context:
+    
+    # Show "Test My Understanding" button only if we have context from latest response
+    if st.session_state.last_context and not st.session_state.quiz_data:
         st.divider()
-        st.subheader("📝 Quick Quiz")
-        quiz_content = generate_quiz(st.session_state.last_context)
-        st.write(quiz_content)
+        if st.button("🧠 Test My Understanding", key="test_understanding_btn", use_container_width=True):
+            # Generate quiz only once per response
+            with st.spinner("Generating quiz questions..."):
+                quiz_data = generate_quiz_questions(st.session_state.last_context)
+                if quiz_data:
+                    st.session_state.quiz_data = quiz_data
+                    st.session_state.quiz_answers = [None] * len(quiz_data)
+                    st.session_state.quiz_submitted = False
+                    st.rerun()
+    
+    # Display quiz interface if questions exist
+    if st.session_state.quiz_data and not st.session_state.quiz_submitted:
+        render_quiz_interface()
+    
+    # Display results if submitted
+    if st.session_state.quiz_submitted:
+        render_quiz_results()
+    
+    # Display simplified explanation if requested
+    if st.session_state.show_simplification:
+        render_simplified_explanation_section()
 
 
 # ============================================================================
@@ -341,6 +613,20 @@ def initialize_session_state():
         st.session_state.pdf_hash = None
     if "current_pdfs" not in st.session_state:
         st.session_state.current_pdfs = []
+    
+    # OPTIMIZATION: Quiz feature session state
+    if "quiz_data" not in st.session_state:
+        st.session_state.quiz_data = None
+    if "quiz_answers" not in st.session_state:
+        st.session_state.quiz_answers = []
+    if "quiz_submitted" not in st.session_state:
+        st.session_state.quiz_submitted = False
+    if "show_simplification" not in st.session_state:
+        st.session_state.show_simplification = False
+    if "simplified_explanation" not in st.session_state:
+        st.session_state.simplified_explanation = ""
+    if "latest_response_id" not in st.session_state:
+        st.session_state.latest_response_id = None
 
 
 # ============================================================================
@@ -473,7 +759,10 @@ def main():
     with col1:
         render_export_button()
     with col2:
-        render_quiz()
+        pass  # Quiz moved to separate section below
+
+    # Render quiz section (5-question feature)
+    render_quiz_section()
 
     # Render sidebar
     render_sidebar()
