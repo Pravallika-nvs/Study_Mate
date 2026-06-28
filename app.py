@@ -241,10 +241,6 @@ def _text_block_is_preformatted(block):
     lines = block.splitlines()
     if any(line.startswith('    ') or line.startswith('\t') for line in lines):
         return True
-    if any(line.strip().startswith(('-', '*', '+')) for line in lines):
-        return True
-    if any(line.lstrip().startswith(tuple(str(i) + "." for i in range(1, 10))) for line in lines):
-        return True
     code_markers = ['for ', 'while ', 'if ', 'else:', 'elif ', 'return ', 'def ', 'class ', '=>', '->', '://']
     if sum(marker in block for marker in code_markers) >= 2:
         return True
