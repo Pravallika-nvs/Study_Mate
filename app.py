@@ -7,8 +7,9 @@ from langchain_text_splitters import CharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_google_genai import ChatGoogleGenerativeAI
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+from datetime import datetime
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Preformatted
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from htmlTemplates import bot_template, user_template, css
 
 
@@ -227,26 +228,106 @@ def render_chat():
 # EXPORT & PDF GENERATION
 # ============================================================================
 
+def _safe_paragraph_text(text):
+    escaped = (
+        text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+    )
+    return escaped.replace("\n", "<br />\n")
+
+
+def _text_block_is_preformatted(block):
+    lines = block.splitlines()
+    if any(line.startswith('    ') or line.startswith('\t') for line in lines):
+        return True
+    if any(line.strip().startswith(('-', '*', '+')) for line in lines):
+        return True
+    if any(line.lstrip().startswith(tuple(str(i) + "." for i in range(1, 10))) for line in lines):
+        return True
+    code_markers = ['for ', 'while ', 'if ', 'else:', 'elif ', 'return ', 'def ', 'class ', '=>', '->', '://']
+    if sum(marker in block for marker in code_markers) >= 2:
+        return True
+    return False
+
+
+def _create_flowables_for_text(text, styles):
+    flowables = []
+    normalized_text = text.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = [block.strip() for block in normalized_text.split("\n\n") if block.strip()]
+
+    for idx, block in enumerate(blocks):
+        if _text_block_is_preformatted(block):
+            flowables.append(Preformatted(block, styles["Code"]))
+        else:
+            flowables.append(Paragraph(_safe_paragraph_text(block), styles["BodyText"]))
+
+        if idx < len(blocks) - 1:
+            flowables.append(Spacer(1, 8))
+
+    return flowables
+
+
+def _make_pdf_flowables_for_message(role, text, styles):
+    flowables = []
+    role_header = Paragraph(f"<b>{role}:</b>", styles["Heading4"])
+    flowables.append(role_header)
+    flowables.append(Spacer(1, 4))
+
+    if not text:
+        flowables.append(Paragraph("<i>(No content)</i>", styles["BodyText"]))
+        flowables.append(Spacer(1, 12))
+        return flowables
+
+    flowables.extend(_create_flowables_for_text(text, styles))
+    flowables.append(Spacer(1, 12))
+    return flowables
+
+
 def export_chat_to_pdf(chat_history):
     """Export chat history to a PDF file."""
     pdf_file = "study_mate_chat.pdf"
-    doc = SimpleDocTemplate(pdf_file)
+    doc = SimpleDocTemplate(
+        pdf_file,
+        leftMargin=36,
+        rightMargin=36,
+        topMargin=36,
+        bottomMargin=36
+    )
     styles = getSampleStyleSheet()
 
+    if "Code" not in styles:
+        styles.add(ParagraphStyle(
+            name="Code",
+            fontName="Courier",
+            fontSize=10,
+            leading=14,
+            leftIndent=12,
+            rightIndent=12,
+            spaceAfter=6,
+            wordWrap="CJK"
+        ))
+    if "Header" not in styles:
+        styles.add(ParagraphStyle(
+            name="Header",
+            fontName="Helvetica-Bold",
+            fontSize=14,
+            leading=18,
+            spaceAfter=6
+        ))
+
     content = []
-    title = Paragraph("Study-Mate Chat History", styles["Title"])
-    content.append(title)
-    content.append(Spacer(1, 12))
+    header_title = Paragraph("Study-Mate – Chat History", styles["Header"])
+    timestamp = Paragraph(
+        f"Exported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        styles["Normal"]
+    )
+    content.extend([header_title, timestamp, Spacer(1, 16)])
 
     for msg in chat_history:
         role = msg["role"].capitalize()
         text = msg["content"]
-        paragraph = Paragraph(
-            f"<b>{role}:</b> {text}",
-            styles["BodyText"]
-        )
-        content.append(paragraph)
-        content.append(Spacer(1, 6))
+        content.extend(_make_pdf_flowables_for_message(role, text, styles))
 
     doc.build(content)
     return pdf_file
@@ -359,6 +440,18 @@ def identify_weak_topics(questions, answers):
     return weak_topics
 
 
+def get_quiz_summary_topics(weak_topics):
+    """Build a short list of quiz topics based on incorrect answers."""
+    if not weak_topics:
+        return []
+    topics = []
+    for topic in weak_topics:
+        text = topic.get("topic", "").strip()
+        if text:
+            topics.append(text)
+    return topics
+
+
 def generate_simplified_explanation(context, weak_topics):
     """
     Generate a simpler explanation when user struggles with quiz.
@@ -466,44 +559,41 @@ def render_quiz_results():
     score_color = "green" if score >= 3 else "orange" if score >= 2 else "red"
     st.markdown(f"### 🎯 Score: **{score}/{total}**")
     
-    # Show incorrect answers
+    # Show incorrect answers with feedback
     incorrect_count = 0
     for idx, question in enumerate(st.session_state.quiz_data):
         correct = question.get("correct_answer")
         if idx < len(st.session_state.quiz_answers) and st.session_state.quiz_answers[idx] != correct:
             incorrect_count += 1
-            st.markdown(f"**Question {idx + 1}:** ❌ Incorrect")
+            st.markdown(f"**Question {idx + 1}:** {question.get('question', '')}")
             st.markdown(f"- Your answer: *{st.session_state.quiz_answers[idx]}*")
             st.markdown(f"- Correct answer: *{correct}*")
-            st.markdown(f"- {question.get('explanation', '')}")
+            if question.get("explanation"):
+                st.markdown(f"- Explanation: {question.get('explanation')}")
             st.markdown("---")
     
-    # Show weak topics if any
-    if incorrect_count > 0:
-        weak_topics = identify_weak_topics(st.session_state.quiz_data, st.session_state.quiz_answers)
-        
-        if weak_topics:
-            st.subheader("🎯 Areas to Improve")
-            for topic in weak_topics:
-                st.markdown(f"**{topic['concept']}**")
-                st.markdown(f"→ {topic['explanation']}")
-            
-            # Adaptive learning offer
-            if score < 3:
-                st.warning("💡 It looks like you're finding this topic challenging. Would you like a simpler explanation?")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Yes, explain more simply", key="simplify_yes"):
-                        st.session_state.show_simplification = True
-                        st.rerun()
-                with col2:
-                    if st.button("No, I'm ready to move on", key="simplify_no"):
-                        st.session_state.quiz_submitted = False
-                        st.session_state.quiz_data = None
-                        st.session_state.quiz_answers = []
-                        st.rerun()
+    weak_topics = identify_weak_topics(st.session_state.quiz_data, st.session_state.quiz_answers)
+    summary_topics = get_quiz_summary_topics(weak_topics)
+
+    if summary_topics:
+        st.markdown("**Quiz summary — topics to review:**")
+        st.markdown(", ".join(summary_topics))
+
+    if score < 3 and incorrect_count > 0:
+        st.warning("💡 It looks like you're finding this topic challenging. Would you like a simpler explanation?")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Yes, explain more simply", key="simplify_yes"):
+                st.session_state.show_simplification = True
+                if not st.session_state.simplified_explanation:
+                    st.session_state.simplified_explanation = ""
+                st.rerun()
+        with col2:
+            if st.button("No, thanks", key="simplify_no"):
+                st.session_state.show_simplification = False
+                st.rerun()
     
-    else:
+    if incorrect_count == 0:
         st.success(f"🎉 Perfect! You scored {score}/{total}. Great understanding!")
         if st.button("Clear quiz and continue", key="clear_quiz"):
             st.session_state.quiz_submitted = False
@@ -529,7 +619,7 @@ def render_simplified_explanation_section():
     st.subheader("📚 Simplified Explanation")
     
     # Generate simplified explanation if not already cached
-    if "simplified_explanation" not in st.session_state:
+    if not st.session_state.simplified_explanation:
         weak_topics = identify_weak_topics(st.session_state.quiz_data, st.session_state.quiz_answers)
         with st.spinner("Generating simplified explanation..."):
             simplified = generate_simplified_explanation(st.session_state.last_context, weak_topics)
