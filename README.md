@@ -1,3 +1,7 @@
+## 🌐 Live Demo
+
+https://studymate-oev9grbpca4ewoxxfxaay2.streamlit.app/
+
 # 📚 Study-Mate
 
 An AI-powered learning assistant that transforms static PDF documents into an interactive learning experience using Retrieval-Augmented Generation (RAG).

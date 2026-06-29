@@ -131,7 +131,7 @@ def get_conversation_chain(vectorstore):
 # ============================================================================
 
 hf_llm = HuggingFaceEndpoint(
-    repo_id="Qwen/Qwen3-8B-Instruct",
+    repo_id="Qwen/Qwen3-VL-8B-Instruct", 
     huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
     temperature=0.3,
     max_new_tokens=1024,
@@ -149,8 +149,8 @@ def _invoke_with_fallback(llm, prompt):
         st.warning("Gemini is unavailable; using Hugging Face fallback.")
         try:
             return hf_llm.invoke(prompt)
-        except Exception:
-            st.error("Both Gemini and Hugging Face failed. Please try again later.")
+        except Exception as e:
+            st.error(f"Both Gemini and Hugging Face failed. Please try again later. {e}")
             return None
 
 
@@ -606,8 +606,12 @@ def render_quiz_results():
         with col2:
             if st.button("No, thanks", key="simplify_no"):
                 st.session_state.show_simplification = False
+                st.session_state.simplified_explanation = ""
+                st.session_state.quiz_submitted = False
+                st.session_state.quiz_data = None
+                st.session_state.quiz_answers = []
                 st.rerun()
-    
+
     if incorrect_count == 0:
         st.success(f"🎉 Perfect! You scored {score}/{total}. Great understanding!")
         if st.button("Clear quiz and continue", key="clear_quiz"):
@@ -648,7 +652,9 @@ def render_simplified_explanation_section():
     with col1:
         if st.button("Back to quiz results", key="back_to_results"):
             st.session_state.show_simplification = False
-            st.rerun()
+            st.session_state.simplified_explanation = ""
+            st.info("Returned to quiz results.")
+            st.experimental_rerun()
     with col2:
         if st.button("Return to chat", key="return_to_chat"):
             st.session_state.quiz_submitted = False
