@@ -10,9 +10,9 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from datetime import datetime
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Preformatted
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from htmlTemplates import bot_template, user_template, css
-
-
+from langchain_huggingface import HuggingFaceEndpoint
+from htmlTemplates import bot_template, user_template, css       
+        
 # ============================================================================
 # CACHED MODEL & LLM INITIALIZATION (Resource-level caching)
 # ============================================================================
@@ -130,6 +130,30 @@ def get_conversation_chain(vectorstore):
 # QUESTION PROCESSING
 # ============================================================================
 
+hf_llm = HuggingFaceEndpoint(
+    repo_id="Qwen/Qwen3-8B-Instruct",
+    huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
+    temperature=0.3,
+    max_new_tokens=1024,
+)
+
+
+def _invoke_with_fallback(llm, prompt):
+    """
+    Call the primary LLM and fall back to HuggingFace if an error occurs.
+    """
+    try:
+        return llm.invoke(prompt)
+    except Exception:
+        # If Gemini hits rate limits or throws any error, continue with HuggingFace.
+        st.warning("Gemini is unavailable; using Hugging Face fallback.")
+        try:
+            return hf_llm.invoke(prompt)
+        except Exception:
+            st.error("Both Gemini and Hugging Face failed. Please try again later.")
+            return None
+
+
 def process_question(user_question):
     """
     Process user question using the conversation chain.
@@ -158,31 +182,37 @@ def process_question(user_question):
     ])
 
     prompt = f"""
-You are Study-Mate, an AI assistant that answers questions using the uploaded PDFs.
+        You are Study-Mate, an AI assistant that answers questions using the uploaded PDFs.
 
-Instructions:
-- Answer using the provided context.
-- Use the conversation history when needed.
-- If the answer is not found in the context, say "I couldn't find that information in the uploaded documents."
-- Be concise and accurate.
-- Preserve formatting: use line breaks, bullet points, and code blocks as needed.
+        Instructions:
+        - Answer using the provided context.
+        - Use the conversation history when needed.
+        - If the answer is not found in the context, say "I couldn't find that information in the uploaded documents."
+        - Be concise and accurate.
+        - Preserve formatting: use line breaks, bullet points, and code blocks as needed.
 
-Conversation History:
-{history}
+        Conversation History:
+        {history}
 
-Document Context:
-{context}
+        Document Context:
+        {context}
 
-User Question:
-{user_question}
-"""
+        User Question:
+        {user_question}
+        """
 
     # OPTIMIZATION: LLM call only happens here, not on other button clicks
     with st.spinner("Thinking..."):
-        response = st.session_state.conversation["llm"].invoke(prompt)
+        response = _invoke_with_fallback(st.session_state.conversation["llm"], prompt)
+
+    if response is None:
+        return None
 
     answer = response.content
-    st.session_state.last_context = context
+    st.session_state.last_context = (
+        f"User Question:\n{user_question}\n\n"
+        f"Assistant Answer:\n{answer}"
+    )
     
     # OPTIMIZATION: Reset quiz when new answer is generated
     # This prevents showing old quiz for new questions
@@ -357,16 +387,18 @@ def render_export_button():
 
 def generate_quiz_questions(context):
     """
-    Generate exactly 5 conceptual multiple-choice questions from the context.
+    Generate exactly 5 conceptual multiple-choice questions from the latest exchange.
     OPTIMIZATION:
     - Generated once per assistant response
     - Stored in session state (not regenerated on reruns)
-    - Focuses on conceptual understanding, not memorization
+    - Focuses on conceptual understanding of the current user/assistant exchange
     """
     quiz_prompt = f"""
-You are an educational expert. Generate exactly 5 multiple-choice questions to test conceptual understanding of the following content. Do NOT generate memorization questions.
+You are an educational expert. Generate exactly 5 multiple-choice questions to test conceptual understanding of the following exchange between a learner and an AI assistant. Do NOT generate memorization questions.
 
-Content:
+Use ONLY the exchange below to generate questions. Do not use the full PDF content.
+
+Exchange:
 {context}
 
 Requirements:
@@ -389,7 +421,9 @@ Return a JSON array (ONLY valid JSON, no other text). Example format:
 Generate 5 questions now:
 """
 
-    response = st.session_state.conversation["llm"].invoke(quiz_prompt)
+    response = _invoke_with_fallback(st.session_state.conversation["llm"], quiz_prompt)
+    if response is None:
+        return None
     
     # Parse JSON response carefully
     try:
@@ -436,18 +470,6 @@ def identify_weak_topics(questions, answers):
     return weak_topics
 
 
-def get_quiz_summary_topics(weak_topics):
-    """Build a short list of quiz topics based on incorrect answers."""
-    if not weak_topics:
-        return []
-    topics = []
-    for topic in weak_topics:
-        text = topic.get("topic", "").strip()
-        if text:
-            topics.append(text)
-    return topics
-
-
 def generate_simplified_explanation(context, weak_topics):
     """
     Generate a simpler explanation when user struggles with quiz.
@@ -473,7 +495,9 @@ Original Context:
 Generate a clear, beginner-friendly explanation:
 """
 
-    response = st.session_state.conversation["llm"].invoke(simplification_prompt)
+    response = _invoke_with_fallback(st.session_state.conversation["llm"], simplification_prompt)
+    if response is None:
+        return ""
     return response.content
 
 
@@ -569,11 +593,6 @@ def render_quiz_results():
             st.markdown("---")
     
     weak_topics = identify_weak_topics(st.session_state.quiz_data, st.session_state.quiz_answers)
-    summary_topics = get_quiz_summary_topics(weak_topics)
-
-    if summary_topics:
-        st.markdown("**Quiz summary — topics to review:**")
-        st.markdown(", ".join(summary_topics))
 
     if score < 3 and incorrect_count > 0:
         st.warning("💡 It looks like you're finding this topic challenging. Would you like a simpler explanation?")
@@ -655,7 +674,7 @@ def render_quiz_section():
     if st.session_state.last_context and not st.session_state.quiz_data:
         st.divider()
         if st.button("🧠 Test My Understanding", key="test_understanding_btn", use_container_width=True):
-            # Generate quiz only once per response
+            # Generate quiz only once for the latest exchange
             with st.spinner("Generating quiz questions..."):
                 quiz_data = generate_quiz_questions(st.session_state.last_context)
                 if quiz_data:
@@ -810,7 +829,7 @@ def main():
     st.header("Study-Mate: Your AI-Powered PDFs Tool :books:")
 
     # Main question input and button
-    col1, col2 = st.columns([4, 1])
+    col1, col2 = st.columns([5, 1], vertical_alignment="bottom")
     with col1:
         user_question = st.text_input(
             "Ask a question about your document(s):",
